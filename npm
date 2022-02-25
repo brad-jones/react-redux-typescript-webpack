@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Sections of this script might need edits before execution, search for "EDITME"
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# >>> ASDF Bootstrap Script
+# ==============================================================================
+# repo: https://github.com/brad-jones/asdf-bootstrap
+# author: Brad Jones <brad@bjc.id.au>
+# license: MIT
+# version: 1.3.4
+# ==============================================================================
+# This script has been designed to be dropped into the root of a project and act
+# as the sole entrypoint into your build automation. Commit a copy of this script
+# into your repo and manage it as if it was your own.
+#
+# This script will do the following things:
+#
+#  - Installs an isolated "local" version of https://asdf-vm.com
+#    If someone already has asdf installed "globally" on their system
+#    this script does not clobber their existing installation.
+#
+#  - Installs all asdf plugins from ./.asdf/plugin-versions
+#    Inspired by https://github.com/asdf-vm/asdf/issues/240#issuecomment-640777756
+#
+#  - Installs all tools defined in .tool-versions
+#
+#  - Also adds .tool-version.lock support in a similar vane to
+#    yarn.lock, package-lock.json, go.sum & others.
+#    This is opt-out by setting ASDF_LOCAL_TOOL_VERSIONS_LOCKFILE=false
+#
+#  - Makes use of the https://www.sigstore.dev to help secure the
+#    software supply chain.
+#
+#  - Finally it passes control over to one of the installed tools.
+#    By default it will execute a tool by the same name as whatever
+#    filename is given to this script. Of course this is configurable.
+#
+#  - Plus some other stuff...
+{
+  set -euo pipefail
+
+  function main {
+    # Grab the the directory that this script is located in & change into it.
+    # This is so that everything past this point can make reliable assumptions
+    # about the path & use simple relative paths without fear.
+    export ASDF_SCRIPT_DIR
+    ASDF_SCRIPT_DIR="$(get_script_dir)"
+    cd "${ASDF_SCRIPT_DIR}"
+
+    # Read in a dotenv file if it exists.
+    # see: https://github.com/motdotla/dotenv
+    load_dot_env
+
+    # >>> EDITME: Script Config
+    # --------------------------------------------------------------------------
+    # All variables are overideable through "ASDF_LOCAL_*" equivalents.
+    export ASDF_VERSION="${ASDF_LOCAL_VERSION:-"v0.9.0"}"
+    export ASDF_SPEED_LOCK="${ASDF_LOCAL_SPEED_LOCK:-"1"}"
+    export ASDF_UTIL_COSIGN_VERSION="${ASDF_LOCAL_UTIL_COSIGN_VERSION:-"v1.5.2"}"
+    export ASDF_UTIL_HASHDIR_VERSION="${ASDF_LOCAL_UTIL_HASHDIR_VERSION:-"v1.0.5"}"
+    export ASDF_REPO="${ASDF_LOCAL_REPO:-"https://github.com/asdf-vm/asdf.git"}"
+    export ASDF_DIR="${ASDF_LOCAL_DIR:-"${ASDF_SCRIPT_DIR}/.asdf/${ASDF_VERSION}"}"
+    export ASDF_UTILS_DIR="${ASDF_LOCAL_UTILS_DIR:-"${ASDF_SCRIPT_DIR}/.asdf/utils"}"
+    export ASDF_DATA_DIR="${ASDF_LOCAL_DATA_DIR:-"${ASDF_DIR}"}"
+    export ASDF_CONFIG_FILE="${ASDF_LOCAL_CONFIG_FILE:-"${ASDF_SCRIPT_DIR}/.asdf/.asdfrc"}"
+    export ASDF_PLUGIN_VERSIONS_FILENAME="${ASDF_LOCAL_PLUGIN_VERSIONS_FILENAME:-"${ASDF_SCRIPT_DIR}/.asdf/.plugin-versions"}"
+    export ASDF_DEFAULT_TOOL_VERSIONS_FILENAME="${ASDF_LOCAL_DEFAULT_TOOL_VERSIONS_FILENAME:-"${ASDF_SCRIPT_DIR}/.tool-versions"}"
+    export ASDF_TOOL_VERSIONS_LOCKFILE="${ASDF_LOCAL_TOOL_VERSIONS_LOCKFILE:-"${ASDF_DEFAULT_TOOL_VERSIONS_FILENAME}.lock"}"
+    export ASDF_BOOTSTRAP_LATEST_URL="${ASDF_LOCAL_BOOTSTRAP_LATEST_URL:-"https://github.com/brad-jones/asdf-bootstrap/releases/latest/download/asdf-bootstrap.sh"}"
+    export ASDF_BOOTSTRAP_UPDATED_FILENAME="${ASDF_LOCAL_BOOTSTRAP_UPDATED_FILENAME:-"${ASDF_SCRIPT_DIR}/.asdf/.updated"}"
+    export ASDF_BOOTSTRAP_UPDATED_EXPIRATION_SECONDS="${ASDF_LOCAL_BOOTSTRAP_UPDATED_EXPIRATION_SECONDS:-"86400"}"
+    # --------------------------------------------------------------------------
+    # >>> EDITME: Script Config
+
+    # Detect the current operating system & architecture.
+    # This script works on most common Linux distros (including WSL) & MacOS.
+    local os
+    os="$(get_os)"
+    local arch
+    arch="$(get_arch)"
+    if [ -z "${IGNORE_OS_ERRORS+x}" ]; then
+      if [ "${os}" == "unknown" ]; then
+        log_std_err "Error: failed to detect operating system!"
+        log_std_err ""
+        log_std_err "This script assumes a Linux (including WSL2) or"
+        log_std_err "MacOS environment, this is something else."
+        log_std_err ""
+        log_std_err "Set 'IGNORE_OS_ERRORS=1' to ignore this check if"
+        log_std_err "you're happy to deal with any consequences."
+        exit 1
+      fi
+      if [ "${arch}" == "unknown" ]; then
+        log_std_err "Error: failed to detect operating system architecture!"
+        log_std_err ""
+        log_std_err "This script assumes a 64-bit environment,"
+        log_std_err "this is something else."
+        log_std_err ""
+        log_std_err "Set 'IGNORE_OS_ERRORS=1' to ignore this check if"
+        log_std_err "you're happy to deal with any consequences."
+        exit 1
+      fi
+      if [ "${os}" == "not-wsl" ]; then
+        log_std_err "Error: unsupported *nix like environment!"
+        log_std_err ""
+        log_std_err "You appear to be running CYGWIN or similar on Windows."
+        log_std_err "Please use WSL2 instead."
+        log_std_err "see: https://docs.microsoft.com/en-us/windows/wsl"
+        log_std_err ""
+        log_std_err "Set 'IGNORE_OS_ERRORS=1' to ignore this check if"
+        log_std_err "you're happy to deal with any consequences."
+        exit 1
+      fi
+    fi
+
+    # While the whole point is to automate as much as possible for the user,
+    # it's not like we can bootstrap their entire operating system, there are
+    # some very basic tools that we assume exist.
+    ensure_command_exists "awk" "https://www.gnu.org/software/gawk"
+    ensure_command_exists "cp" "https://en.wikipedia.org/wiki/Cp_(Unix)"
+    ensure_command_exists "curl" "https://curl.se"
+    ensure_command_exists "cut" "https://en.wikipedia.org/wiki/Cut_(Unix)"
+    ensure_command_exists "git" "https://git-scm.com"
+    ensure_command_exists "grep" "https://www.gnu.org/software/grep"
+    ensure_command_exists "mkdir" "https://en.wikipedia.org/wiki/Mkdir"
+    ensure_command_exists "rm" "https://en.wikipedia.org/wiki/Rm_(Unix)"
+    ensure_command_exists "sed" "https://www.gnu.org/software/sed"
+    ensure_command_exists "sort" "https://en.wikipedia.org/wiki/Sort_(Unix)"
+    ensure_command_exists "tar" "https://www.gnu.org/software/tar"
+    ensure_command_exists "uname" "https://en.wikipedia.org/wiki/Uname"
+    ensure_command_exists "openssl" "https://www.openssl.org"
+    ensure_command_exists "base64" "https://linux.die.net/man/1/base64"
+
+    # Delete the existing asdf directory if ASDF_LOCAL_REINSTALL=1
+    # This is handy for testing this script :)
+    if [ -n "${ASDF_LOCAL_REINSTALL+x}" ]; then
+      rm -rf "${ASDF_DIR}"
+      rm -rf "${ASDF_SCRIPT_DIR}/.asdf/bin"
+      rm -rf "${ASDF_SCRIPT_DIR}/.asdf/utils"
+      rm -rf "${ASDF_TOOL_VERSIONS_LOCKFILE}"
+    fi
+
+    # Install cosign, a CLI tool to interface with https://www.sigstore.dev
+    # We need this to verify other tools that we install, such as hashdir along
+    # with the self update functionality of this very script.
+    # Doing our bit to secure the software supply chain.
+    install_cosign "${os}" "${arch}" \
+      "${ASDF_UTIL_COSIGN_VERSION}" "${ASDF_UTILS_DIR}"
+
+    # Self update check.
+    # The script will now check for a new version of it's self and offer to update.
+    # Opt out by setting $ASDF_BOOTSTRAP_UPDATED_EXPIRATION_SECONDS to -1
+    self_update "${os}" "${arch}" \
+      "${ASDF_BOOTSTRAP_LATEST_URL}" \
+      "${ASDF_BOOTSTRAP_UPDATED_FILENAME}" \
+      "${ASDF_BOOTSTRAP_UPDATED_EXPIRATION_SECONDS}" \
+      "$@"
+
+    # Install the hashdir tool that this script uses for the lockfile functionality
+    # see: https://github.com/brad-jones/hashdir
+    install_hashdir "${os}" "${arch}" \
+      "${ASDF_UTIL_HASHDIR_VERSION}" "${ASDF_UTILS_DIR}"
+
+    # Install asdf, the asdf plugins & our tools.
+    install_asdf "${ASDF_REPO}" "${ASDF_VERSION}" "${ASDF_DIR}"
+    install_asdf_plugins "${ASDF_PLUGIN_VERSIONS_FILENAME}" "${ASDF_DIR}"
+    install_asdf_tools "${ASDF_DEFAULT_TOOL_VERSIONS_FILENAME}" "${ASDF_DIR}"
+
+    # Export the versions of our tools as environment variables so that the
+    # executed tool, for example a task runner, can use the same versions of
+    # those tools when building, pulling docker images.
+    #
+    # This is about ensuring that ".tool-versions" remains a single
+    # source of truth for the entire solution / project.
+    export_tool_versions "${ASDF_DEFAULT_TOOL_VERSIONS_FILENAME}"
+
+    # This allows us to create our own set of shims under ./.asdf/bin
+    if [ "${ASDF_SHIM_OF_SHIM:-}" != "" ]; then
+      local shim_of_shim="${ASDF_SHIM_OF_SHIM}"
+      unset ASDF_SHIM_OF_SHIM
+      exec "${shim_of_shim}" "$@"
+    fi
+
+    # >>> EDITME: Execution
+    # --------------------------------------------------------------------------
+    # Pass control over to one of the the tools that asdf installed for us,
+    # usually a task runner of some sort. eg: https://taskfile.dev perhaps
+
+    # By default we just execute an installed tool that has the same name as
+    # this very script. But feel free to comment this out and replace with
+    # whatever execuection or logic that makes sense for your application.
+    exec "$(get_script_name)" "$@"
+
+    # --------------------------------------------------------------------------
+    # >>> EDITME: Execution
+  }
+
+  function get_script_name {
+    basename "${BASH_SOURCE[0]}"
+  }
+
+  # see: https://stackoverflow.com/questions/59895
+  function get_script_dir {
+    cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd
+  }
+
+  function load_dot_env {
+    local path="${1:-.env}"
+    if [ -f "${path}" ]; then
+      set -o allexport
+      # shellcheck disable=SC1090
+      source "${path}"
+      set +o allexport
+    fi
+  }
+
+  function log_std_err {
+    local msg="$1"
+    echo >&2 "${msg}" 1>&2
+  }
+
+  function log_heading {
+    local msg="$1"
+    echo "! >>> ${msg}"
+    echo "! -------------------------------------------------------------------------------------------------------------------- !"
+  }
+
+  function log_missing_command {
+    local cmd="$1"
+    local link="$2"
+    log_std_err "Error: ${cmd} not found!"
+    log_std_err ""
+    log_std_err "This bootstrap script can not operate without it."
+    log_std_err "Please install manually."
+    log_std_err ""
+    log_std_err "see: ${link}"
+  }
+
+  function command_exist {
+    local cmd="$1"
+    if ! command -v "${cmd}" >/dev/null; then
+      return 1
+    fi
+    return 0
+  }
+
+  function ensure_command_exists {
+    local cmd="$1"
+    local link="$2"
+    if ! command_exist "${cmd}"; then
+      log_missing_command "${cmd}" "${link}"
+      exit 1
+    fi
+  }
+
+  function get_os {
+    case "$(uname -s)" in
+    Darwin) echo 'darwin' ;;
+    Linux) echo 'linux' ;;
+    CYGWIN* | MINGW32* | MSYS* | MINGW*) echo 'not-wsl' ;;
+    *) echo 'unknown' ;;
+    esac
+  }
+
+  function get_arch {
+    case "$(uname -m)" in
+    x86_64) echo 'amd64' ;;
+    aarch64 | arm64) echo 'arm64' ;;
+    *) echo 'unknown' ;;
+    esac
+  }
+
+  function install_cosign {
+    local os="$1"
+    local arch="$2"
+    local version="$3"
+    local dir="$4"
+    local baseURL="https://github.com/sigstore/cosign/releases/download/${version}"
+    local url="${baseURL}/cosign-${os}-${arch}"
+
+    # bail out if already installed
+    if [ -f "${dir}/cosign" ]; then return; fi
+
+    # download cosign and it's signature
+    log_heading "Installing cosign (internal utility)"
+    mkdir -p "${dir}"
+    echo "downloading: ${url}"
+    curl -L "${url}" -o "${dir}/cosign"
+    echo "downloading: ${url}.sig"
+    curl -L "${url}.sig" -o "${dir}/cosign.sig"
+    echo "downloading: ${baseURL}/release-cosign.pub"
+    curl -L "${baseURL}/release-cosign.pub" -o "${dir}/cosign.pem"
+
+    # verify cosign with openssl
+    echo "performing offline verification of cosign with openssl"
+    openssl dgst -sha256 -verify "${dir}/cosign.pem" -signature <(base64 -d <"${dir}/cosign.sig") "${dir}/cosign" ||
+      (rm -f "${dir}/cosign" && rm -f "${dir}/cosign.pem" && rm -f "${dir}/cosign.pub" && exit 1)
+    rm -f "${dir}/cosign.pem"
+    rm -f "${dir}/cosign.pub"
+    chmod +x "${dir}/cosign"
+
+    # if thats ok, lets use cosign to verify it's self
+    # this will make sure there is a valid entry in rekor
+    echo "performing online verification of cosign with cosign"
+    COSIGN_EXPERIMENTAL=1 "${dir}/cosign" verify-blob --signature "${url}-keyless.sig" "${dir}/cosign" ||
+      (rm -f "${dir}/cosign" && rm -f "${dir}/cosign.pem" && rm -f "${dir}/cosign.pub" && exit 1)
+
+    echo "protecting your supply chain with https://www.sigstore.dev"
+    echo ""
+  }
+
+  function install_hashdir {
+    local os="$1"
+    local arch="$2"
+    local version="$3"
+    local dir="$4"
+    local url="https://github.com/brad-jones/hashdir/releases/download/${version}/hashdir_${os}_${arch}"
+
+    # bail out if already installed
+    if [ -f "${dir}/hashdir" ]; then return; fi
+
+    # download hashdir
+    log_heading "Installing hashdir (internal utility)"
+    mkdir -p "${dir}"
+    echo "downloading: ${url}"
+    curl -L "${url}" -o "${dir}/hashdir"
+
+    # verify hashdir with cosign
+    echo "performing online verification of hashdir with cosign"
+    COSIGN_EXPERIMENTAL=1 "${dir}/cosign" verify-blob --signature "${url}.sig" "${dir}/hashdir" ||
+      (rm -f "${dir}/hashdir" && exit 1)
+    chmod +x "${dir}/hashdir"
+
+    echo "protecting your supply chain with https://www.sigstore.dev"
+    echo ""
+  }
+
+  function install_asdf {
+    local repo="$1"
+    local version="$2"
+    local dir="$3"
+    if [ ! -d "${dir}" ]; then
+      log_heading "Installing ASDF from ${repo}"
+      git -c advice.detachedHead=false clone \
+        --depth "1" --branch "${version}" \
+        "${repo}" "${dir}"
+      echo ""
+    fi
+    # shellcheck disable=SC1091
+    source "${dir}/asdf.sh"
+  }
+
+  # see: https://github.com/asdf-vm/asdf/issues/240#issuecomment-640777756
+  # also: https://github.com/asdf-vm/asdf/issues/829 & others...
+  function install_asdf_plugins {
+    local pluginFile="$1"
+    local dir="$2"
+    echo -e "$(cat "${pluginFile}")\n" | while read -r tool gitUrl gitRef; do
+      if [ "${tool}" != "" ]; then
+        install_or_update_asdf_plugin "${tool}" "${gitUrl}" "${gitRef}" "${dir}"
+      fi
+    done
+  }
+
+  function install_or_update_asdf_plugin {
+    local tool="$1"
+    local gitUrl="$2"
+    local gitRef="$3"
+    local dir="$4"
+    if [ ! -d "${dir}/plugins/${tool}" ]; then
+      install_asdf_plugin "${tool}" "${gitUrl}" "${gitRef}" "${dir}"
+    else
+      currentGitRef="$(cd "${dir}/plugins/${tool}" && git rev-parse HEAD)"
+      if [ "${gitRef}" != "${currentGitRef}" ]; then
+        install_asdf_plugin "${tool}" "${gitUrl}" "${gitRef}" "${dir}"
+      fi
+    fi
+  }
+
+  function install_asdf_plugin {
+    local tool="$1"
+    local gitUrl="$2"
+    local gitRef="$3"
+    local dir="$4"
+    log_heading "Installing ASDF Plugin for ${tool}"
+    rm -rf "${dir}/plugins/${tool}"
+    mkdir -p "${dir}/plugins/${tool}"
+    cd "${dir}/plugins/${tool}" &&
+      git -c init.defaultBranch=master init &&
+      git remote add origin "${gitUrl}" &&
+      git fetch --depth "1" origin "${gitRef}" &&
+      git reset --hard FETCH_HEAD &&
+      cd -
+    echo ""
+  }
+
+  function install_asdf_tools {
+    local toolVersionsFile="$1"
+    local dir="$2"
+    echo -e "$(cat "${toolVersionsFile}")\n" | while read -r tool version; do
+      if [ "${tool}" != "" ]; then
+        if [ ! -d "${dir}/installs/${tool}/${version}" ]; then
+          log_heading "Installing ${tool} @ ${version}"
+          asdf install "${tool}" "${version}"
+          ensure_lock_matches "${tool}" "${version}"
+          create_shim_of_shim "${tool}"
+          echo ""
+        else
+          # When ASDF_SPEED_LOCK is set to 1 (the default) we will not bother
+          # re-checking the lockfile for tools that at least "appear" to already
+          # be installed. This speeds up the start time of this script significantly.
+          # And the author belives it's an acceptable compromise.
+          if [ "${ASDF_SPEED_LOCK}" != "1" ]; then
+            ensure_lock_matches "${tool}" "${version}"
+          fi
+        fi
+      fi
+    done
+  }
+
+  function create_shim_of_shim {
+    local tool="$1"
+    mkdir -p "${ASDF_SCRIPT_DIR}/.asdf/bin"
+    # shellcheck disable=SC2016
+    echo -e '#!/usr/bin/env bash\nset -euo pipefail\ndir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"\nASDF_SHIM_OF_SHIM="'"${tool}"'" exec "${dir}/../../'"$(get_script_name)"'" "$@"' >"${ASDF_SCRIPT_DIR}/.asdf/bin/${tool}"
+    chmod +x "${ASDF_SCRIPT_DIR}/.asdf/bin/${tool}"
+  }
+
+  function ensure_lock_matches {
+    local tool="$1"
+    local version="$2"
+
+    if [ "${ASDF_TOOL_VERSIONS_LOCKFILE}" == "false" ]; then
+      return 0
+    fi
+
+    local checksum
+    checksum="$(
+      get_checksum_of_dir "${ASDF_DATA_DIR}/installs/${tool}/${version}"
+    )"
+
+    local os arch
+    os="$(get_os)"
+    arch="$(get_arch)"
+
+    if [ -f "${ASDF_TOOL_VERSIONS_LOCKFILE}" ]; then
+      local matched=0
+      while read -r lockedTool lockedVersion lockedOS lockedArch lockedChecksum; do
+        if [[ ${lockedTool} == "${tool}" && ${lockedVersion} == "${version}" && ${lockedOS} == "${os}" && ${lockedArch} == "${arch}" ]]; then
+          if [ "${lockedChecksum}" == "${checksum}" ]; then
+            matched=1
+            break
+          else
+            log_std_err "Error: checksum mismatch on ${tool} @ ${version}"
+            log_std_err "expected: ${lockedChecksum}"
+            log_std_err "calculated: ${checksum}"
+            exit 1
+          fi
+        fi
+      done < <(echo -e "$(cat "${ASDF_TOOL_VERSIONS_LOCKFILE}")\n")
+      if [ ${matched} == 1 ]; then
+        return 0
+      fi
+    fi
+
+    echo "${tool} ${version} ${os} ${arch} ${checksum}" >>"${ASDF_TOOL_VERSIONS_LOCKFILE}"
+    echo "locked ${tool} @ ${version} to ${checksum}"
+  }
+
+  function get_checksum_of_dir {
+    local path result os arch
+    path="$1"
+
+    result="$("${ASDF_UTILS_DIR}"/hashdir -alg sha512 "${path}")"
+    echo "sha512:${result}"
+  }
+
+  function export_tool_versions {
+    local toolVersionsFile="$1"
+    tmpFile="$(mktemp /tmp/bootstraper.XXXXXX)"
+    trap 'rm -f ${tmpFile}' EXIT
+    echo -e "$(cat "${toolVersionsFile}")\n" | while read -r tool version; do
+      if [ "${tool}" != "" ]; then
+        # Can't use ${tool^^} because of MacOS, :sigh:
+        # see: https://hybriddbablog.com/2021/01/25/bash-bad-substitution-upgrade-your-bash-version
+        echo "ASDF_${tool}_VERSION=\"${version}\"" >>"${tmpFile}"
+      fi
+    done
+    load_dot_env "${tmpFile}"
+    rm -f "${tmpFile}"
+  }
+
+  function self_update {
+    local os="$1"
+    local arch="$2"
+    local latestUrl="$3"
+    local updatedFile="$4"
+    local expiration="$5"
+    expiration=$((expiration + 0))
+    local args="$6"
+
+    # Bail out if the self update functionality has been disabled
+    if ((expiration == -1)); then return; fi
+
+    # Bail out if a human is not their to accept update
+    if ! [ -t 0 ]; then return; fi
+
+    # Decide if we need to bother checking for an update
+    # Checking on every script start would be too slow
+    # Defaults to checking at least every 24 hours.
+    local update="0"
+    if [ -f "${updatedFile}" ]; then
+      local now
+      now=$(date +%s)
+      now=$((now + 0))
+
+      local updatedAt
+      updatedAt=$(cat "${updatedFile}")
+      updatedAt=$((updatedAt + 0))
+
+      if ((now - updatedAt > expiration)); then
+        update="1"
+      fi
+    else
+      update="1"
+    fi
+
+    if [ "${update}" == "1" ]; then
+      log_heading "Self Update"
+
+      echo "downloading: ${latestUrl}"
+      curl -L "${latestUrl}" -o "${BASH_SOURCE[0]}.new"
+      echo "written: ${BASH_SOURCE[0]}.new"
+      echo ""
+
+      echo "verifying new version with cosign"
+      COSIGN_EXPERIMENTAL=1 "${ASDF_UTILS_DIR}/cosign" verify-blob \
+        --signature "${latestUrl}.sig" "${BASH_SOURCE[0]}.new" ||
+        (rm -f "${BASH_SOURCE[0]}.new" && exit 1)
+      echo "protecting your supply chain with https://www.sigstore.dev"
+      echo ""
+
+      local currentVersion
+      currentVersion="$(grep '# version:' <"${BASH_SOURCE[0]}" | head -n 1 | sed -e 's/# version: //g')"
+      echo "current version: ${currentVersion}"
+
+      local newVersion
+      newVersion="$(grep '# version:' <"${BASH_SOURCE[0]}.new" | head -n 1 | sed -e 's/# version: //g')"
+      echo "new version: ${newVersion}"
+      echo ""
+
+      diff "${BASH_SOURCE[0]}" "${BASH_SOURCE[0]}.new" ||
+        (
+          echo ""
+          echo "Are you happy with these changes?"
+          select yn in "Yes" "No"; do
+            case $yn in
+            Yes)
+              mv "${BASH_SOURCE[0]}.new" "${BASH_SOURCE[0]}"
+              chmod +x "${BASH_SOURCE[0]}"
+              date +%s >"${updatedFile}"
+              echo "Executing new version of script..."
+              echo ""
+              exec "${BASH_SOURCE[0]}" "$args"
+              break
+              ;;
+            No)
+              rm -f "${BASH_SOURCE[0]}.new"
+              date +%s >"${updatedFile}"
+              exit
+              ;;
+            esac
+          done
+        )
+
+      rm -f "${BASH_SOURCE[0]}.new"
+      date +%s >"${updatedFile}"
+    fi
+
+  }
+
+  # Execute the script
+  main "$@"
+  exit $?
+}
